@@ -904,3 +904,71 @@ class TestMultiAppModeIsolationAndRobustness:
         assert resp_state.status_code == 200
         assert "simulation" in recorded_modes
 
+    def test_cross_app_session_mode_mismatch_rejected(self):
+        """Reusing a session_id created on a production app inside a simulation app endpoint is rejected."""
+        server = HTTPEnvServer(
+            env=ModeAwareTestEnvironment,
+            action_cls=CallToolAction,
+            observation_cls=CallToolObservation,
+            max_concurrent_envs=4,
+        )
+        app_prod = FastAPI()
+        server.register_routes(app_prod, mode="production")
+        app_sim = FastAPI()
+        server.register_routes(app_sim, mode="simulation")
+
+        client_prod = TestClient(app_prod)
+        client_sim = TestClient(app_sim)
+
+        # 1. Create session on production app
+        prod_create = client_prod.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "openenv/session/create",
+                "id": 1,
+            },
+        )
+        assert prod_create.status_code == 200
+        prod_sid = prod_create.json()["result"]["session_id"]
+
+        # 2. Attempt to list tools using prod_sid on simulation app
+        sim_list = client_sim.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "params": {"session_id": prod_sid},
+                "id": 2,
+            },
+        )
+        assert sim_list.status_code == 200
+        assert "error" in sim_list.json()
+        assert "belongs to mode" in sim_list.json()["error"]["message"]
+
+        # 3. Attempt to call tool using prod_sid on simulation app
+        sim_call = client_sim.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "session_id": prod_sid,
+                    "name": "search_live",
+                    "arguments": {"query": "test"},
+                },
+                "id": 3,
+            },
+        )
+        assert sim_call.status_code == 200
+        assert "error" in sim_call.json()
+        assert "belongs to mode" in sim_call.json()["error"]["message"]
+
+        # 4. Attempt to attach to prod_sid via simulation WebSocket /ws
+        with client_sim.websocket_connect(f"/ws?session_id={prod_sid}") as ws:
+            raw = ws.receive_text()
+            msg = json.loads(raw)
+            assert msg["type"] == "error"
+            assert "belongs to mode" in msg["data"]["message"]
+
+

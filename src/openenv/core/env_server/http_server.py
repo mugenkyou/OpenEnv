@@ -252,6 +252,7 @@ class HTTPEnvServer:
 
         # Session management for WebSocket connections
         self._sessions: Dict[str, Optional[Environment]] = {}
+        self._session_modes: Dict[str, str] = {}
         self._session_executors: Dict[str, ThreadPoolExecutor] = {}
         self._session_stacks: Dict[str, AsyncExitStack] = {}
         self._session_info: Dict[str, SessionInfo] = {}
@@ -457,6 +458,8 @@ class HTTPEnvServer:
 
         async with self._session_lock:
             self._sessions[session_id] = env
+            if target_mode is not None:
+                self._session_modes[session_id] = target_mode
             self._session_stacks[session_id] = stack
             now = time.time()
             self._session_info[session_id] = SessionInfo(
@@ -479,6 +482,7 @@ class HTTPEnvServer:
         """
         async with self._session_lock:
             env = self._sessions.pop(session_id, None)
+            self._session_modes.pop(session_id, None)
             executor = self._session_executors.pop(session_id, None)
             stack = self._session_stacks.pop(session_id, None)
             self._session_info.pop(session_id, None)
@@ -868,6 +872,7 @@ class HTTPEnvServer:
                         attached = False
                         env = self._sessions.pop(target_session_id, _MISSING)
                     if not attached and env is not _MISSING:
+                        self._session_modes.pop(target_session_id, None)
                         executor = self._session_executors.pop(target_session_id, None)
                         stack = self._session_stacks.pop(target_session_id, None)
                         self._session_info.pop(target_session_id, None)
@@ -924,6 +929,7 @@ class HTTPEnvServer:
             elif requested_session_id:
                 async with self._session_lock:
                     _env = self._sessions.get(requested_session_id, _MISSING)
+                    _session_mode = self._session_modes.get(requested_session_id)
 
                 if _env is _MISSING:
                     return JsonRpcResponse.error_response(
@@ -936,6 +942,13 @@ class HTTPEnvServer:
                     return JsonRpcResponse.error_response(
                         JsonRpcErrorCode.INVALID_REQUEST,
                         f"Session {requested_session_id} is still initializing; retry shortly",
+                        request_id=request_id,
+                    )
+
+                if _session_mode is not None and _session_mode != app_mode.value:
+                    return JsonRpcResponse.error_response(
+                        JsonRpcErrorCode.INVALID_REQUEST,
+                        f"Session '{requested_session_id}' belongs to mode '{_session_mode}' and cannot be accessed from '{app_mode.value}' endpoint",
                         request_id=request_id,
                     )
 
@@ -1674,6 +1687,11 @@ all schema information needed to interact with the environment.
                         if attached_env is None:
                             raise RuntimeError(
                                 f"Session {requested_session_id} is still initializing"
+                            )
+                        _session_mode = self._session_modes.get(requested_session_id)
+                        if _session_mode is not None and _session_mode != app_mode.value:
+                            raise RuntimeError(
+                                f"Session {requested_session_id} belongs to mode '{_session_mode}' and cannot be attached to '{app_mode.value}' endpoint"
                             )
                         if requested_session_id in self._session_websocket_attachments:
                             raise RuntimeError(

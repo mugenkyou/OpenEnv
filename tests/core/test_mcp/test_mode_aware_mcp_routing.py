@@ -247,7 +247,8 @@ class TestModeAwareMCPRouting:
         assert call_sim.status_code == 200
         res_sim = call_sim.json()
         assert "error" in res_sim
-        assert "not available in production mode" in res_sim["error"]["message"]
+        assert res_sim["error"]["code"] == -32602
+        assert "search_mock" in res_sim["error"]["message"]
 
     def test_simulation_mode_calls_simulation_tools(self, sim_server_app):
         """Simulation tools/call successfully executes simulation tools, rejecting production tools."""
@@ -295,7 +296,8 @@ class TestModeAwareMCPRouting:
         assert call_prod.status_code == 200
         res_prod = call_prod.json()
         assert "error" in res_prod
-        assert "not available in simulation mode" in res_prod["error"]["message"]
+        assert res_prod["error"]["code"] == -32602
+        assert "search_live" in res_prod["error"]["message"]
 
     def test_mode_aware_tool_shadows_fastmcp_shared_tool(self, prod_server_app):
         """Production mode tool overrides a shared FastMCP tool with the same name."""
@@ -732,3 +734,50 @@ class TestModeAwareMCPRouting:
         assert data["error"]["code"] == -32603
         assert "FastMCP client connection failed" in data["error"]["message"]
         assert "result" not in data
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [("production", "PRODUCTION_OVERRIDE"), ("simulation", "FASTMCP_BASE")],
+)
+async def test_shared_tool_remains_available_outside_override_mode(mode, expected):
+    env = ModeAwareTestEnvironment()
+    env.set_mode(mode)
+    try:
+        listed = await env._async_handle_list_tools()
+        assert [t.name for t in listed.tools].count("override_me") == 1
+        called = await env._async_handle_call_tool(
+            CallToolAction(tool_name="override_me", arguments={})
+        )
+        assert called.error is None
+        assert called.result.data == expected
+    finally:
+        env.close()
+
+
+@pytest.mark.parametrize(
+    "mode,expected",
+    [("production", "PRODUCTION_OVERRIDE"), ("simulation", "FASTMCP_BASE")],
+)
+def test_http_shared_tool_remains_available_outside_override_mode(mode, expected):
+    server = HTTPEnvServer(
+        ModeAwareTestEnvironment, CallToolAction, CallToolObservation
+    )
+    app = FastAPI()
+    server.register_routes(app, mode=mode)
+    with TestClient(app) as client:
+        listed = client.post(
+            "/mcp", json={"jsonrpc": "2.0", "method": "tools/list", "id": 1}
+        ).json()
+        assert [t["name"] for t in listed["result"]["tools"]].count("override_me") == 1
+        called = client.post(
+            "/mcp",
+            json={
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "override_me", "arguments": {}},
+                "id": 2,
+            },
+        ).json()
+        assert "error" not in called
+        assert called["result"]["data"] == expected

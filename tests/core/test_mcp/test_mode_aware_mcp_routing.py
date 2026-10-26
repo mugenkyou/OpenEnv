@@ -505,81 +505,62 @@ class TestModeAwareMCPRouting:
             res = await mcp_client.call_tool("search_live", query="client-test")
             assert res == "LIVE: client-test"
 
-    def test_cross_app_session_reuse_rejected(self):
-        """A session created in production mode cannot be accessed from a simulation app, and vice-versa."""
+    @pytest.mark.parametrize("source_mode", ["production", "simulation"])
+    @pytest.mark.parametrize("production_first", [True, False])
+    def test_cross_app_session_reuse_rejected(self, source_mode, production_first):
+        """Registration order must not change a session's mode binding."""
         server = HTTPEnvServer(
-            env=ModeAwareTestEnvironment,
-            action_cls=CallToolAction,
-            observation_cls=CallToolObservation,
+            ModeAwareTestEnvironment,
+            CallToolAction,
+            CallToolObservation,
             max_concurrent_envs=4,
         )
-        prod_app = FastAPI()
-        sim_app = FastAPI()
-        server.register_routes(prod_app, mode="production")
-        server.register_routes(sim_app, mode="simulation")
-
-        prod_client = TestClient(prod_app)
-        sim_client = TestClient(sim_app)
-
-        # Create a production session
-        prod_create = prod_client.post(
-            "/mcp",
-            json={"jsonrpc": "2.0", "method": "openenv/session/create", "id": 1},
-        )
-        assert prod_create.status_code == 200
-        prod_sid = prod_create.json()["result"]["session_id"]
-
-        # Attempt to use production session from simulation app -> rejected with -32602
-        sim_call = sim_client.post(
-            "/mcp",
-            json={
-                "jsonrpc": "2.0",
-                "method": "tools/call",
-                "params": {
-                    "name": "search_live",
-                    "arguments": {"query": "test"},
-                    "session_id": prod_sid,
+        apps = {"production": FastAPI(), "simulation": FastAPI()}
+        modes = ["production", "simulation"]
+        for mode in modes if production_first else reversed(modes):
+            server.register_routes(apps[mode], mode=mode)
+        other_mode = "simulation" if source_mode == "production" else "production"
+        source, other = TestClient(apps[source_mode]), TestClient(apps[other_mode])
+        session_id = source.post(
+            "/mcp", json={"jsonrpc": "2.0", "method": "openenv/session/create", "id": 1}
+        ).json()["result"]["session_id"]
+        tool = "search_live" if source_mode == "production" else "search_mock"
+        try:
+            for method in ("tools/list", "tools/call"):
+                request = {
+                    "jsonrpc": "2.0",
+                    "method": method,
+                    "id": 2,
+                    "params": {
+                        "session_id": session_id,
+                        "name": tool,
+                        "arguments": {"query": "test"},
+                    },
+                }
+                rejected = other.post("/mcp", json=request).json()
+                assert rejected["error"]["code"] == -32602
+                accepted = source.post("/mcp", json=request).json()
+                assert "error" not in accepted
+                if method == "tools/list":
+                    assert tool in {t["name"] for t in accepted["result"]["tools"]}
+                else:
+                    expected = (
+                        "LIVE: test" if source_mode == "production" else "MOCK: test"
+                    )
+                    assert accepted["result"]["data"] == expected
+            with other.websocket_connect(f"/ws?session_id={session_id}") as ws:
+                response = ws.receive_json()
+                assert response["type"] == "error"
+                assert "belongs to mode" in response["data"]["message"]
+        finally:
+            source.post(
+                "/mcp",
+                json={
+                    "jsonrpc": "2.0",
+                    "method": "openenv/session/close",
+                    "id": 3,
+                    "params": {"session_id": session_id},
                 },
-                "id": 2,
-            },
-        )
-        assert sim_call.status_code == 200
-        err = sim_call.json().get("error")
-        assert err is not None
-        assert err["code"] == -32602
-        assert "belongs to mode 'production', not 'simulation'" in err["message"]
-
-    def test_cross_app_websocket_session_attach_rejected(self):
-        """Attaching to a WebSocket session across different mode apps on the same server is rejected."""
-        server = HTTPEnvServer(
-            env=ModeAwareTestEnvironment,
-            action_cls=CallToolAction,
-            observation_cls=CallToolObservation,
-            max_concurrent_envs=4,
-        )
-        prod_app = FastAPI()
-        sim_app = FastAPI()
-        server.register_routes(prod_app, mode="production")
-        server.register_routes(sim_app, mode="simulation")
-
-        prod_client = TestClient(prod_app)
-        sim_client = TestClient(sim_app)
-
-        # Create a production session
-        prod_create = prod_client.post(
-            "/mcp",
-            json={"jsonrpc": "2.0", "method": "openenv/session/create", "id": 1},
-        )
-        prod_sid = prod_create.json()["result"]["session_id"]
-
-        # Attempt WebSocket attach via simulation app -> error message received
-        with sim_client.websocket_connect(f"/ws?session_id={prod_sid}") as ws:
-            raw = ws.receive_text()
-            data = json.loads(raw)
-            assert data["type"] == "error"
-            assert (
-                "belongs to mode 'production', not 'simulation'"
-                in data["data"]["message"]
             )
 
     def test_cross_app_session_close_rejected(self):
